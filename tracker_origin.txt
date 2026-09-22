@@ -1,0 +1,8 @@
+# Public URL of the machine running the tracker, read by the deployed site.
+# Empty (or comments only) means there is no remote tracker and the site shows
+# sample data. TRACKER_ORIGIN in the host's environment overrides this file.
+#
+# This is a Cloudflare quick tunnel, which changes whenever the tunnel restarts.
+# Swap in a permanent URL (ngrok reserved domain or a named Cloudflare tunnel)
+# to stop it going stale.
+https://taught-rank-explosion-tba.trycloudflare.com

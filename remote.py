@@ -11,22 +11,59 @@ import logging
 import os
 import urllib.error
 import urllib.request
+from functools import lru_cache
+from pathlib import Path
 
 log = logging.getLogger(__name__)
 
 TIMEOUT_S = 10
+ORIGIN_FILE = Path(__file__).resolve().parent / "tracker_origin.txt"
 
 
 def origin():
-    return os.environ.get("TRACKER_ORIGIN", "").rstrip("/")
+    """Where the tracker is published.
+
+    TRACKER_ORIGIN wins. Otherwise tracker_origin.txt, which is committed so a
+    deployment can follow the tracker without anyone editing host settings;
+    an empty file means there is no remote tracker.
+    """
+    from_env = os.environ.get("TRACKER_ORIGIN", "").strip()
+    if from_env:
+        return from_env.rstrip("/")
+    try:
+        for line in ORIGIN_FILE.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                return line.rstrip("/")
+    except OSError:
+        pass
+    return ""
 
 
 def token():
     return os.environ.get("TRACKER_TOKEN", "")
 
 
+@lru_cache(maxsize=1)
+def _own_camera():
+    """True when this machine watches the tank itself, so it is the tracker.
+
+    Without this a committed tracker_origin.txt would make the tracker proxy
+    to itself. Cached: it only depends on the environment at startup.
+    """
+    if os.environ.get("LIVE_TANK_OFFLINE") == "1":
+        return False
+    try:
+        from live_tank.config import load_settings
+
+        return load_settings().configured
+    except Exception:
+        return False
+
+
 def enabled():
-    return bool(origin())
+    """True when this instance should fetch from a tracker elsewhere."""
+    return bool(origin()) and not _own_camera()
 
 
 def fetch(path, timeout=TIMEOUT_S):

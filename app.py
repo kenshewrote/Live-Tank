@@ -46,22 +46,38 @@ service.start()
 
 
 def local_token():
-    """Token this instance demands on its own /api routes (tracker machine)."""
+    """Token this instance demands from outside callers (tracker machine)."""
     return os.environ.get("LIVE_TANK_TOKEN", "")
 
 
-@app.before_request
-def guard_api():
-    """Public URL of the tracker: only callers holding the token get data.
+def from_outside(req):
+    """True when the request came through a tunnel or proxy rather than the LAN.
 
-    The site's own pages are never guarded, and an instance that proxies to a
-    remote tracker does not guard either: its visitors are the public.
+    An ngrok or Cloudflare tunnel connects to this app from localhost, so the
+    client address says nothing; the forwarding headers it adds do.
     """
-    wanted = local_token()
-    if not wanted or remote.enabled() or not request.path.startswith("/api/"):
+    return bool(req.headers.get("X-Forwarded-For")
+                or req.headers.get("CF-Connecting-IP")
+                or req.headers.get("X-Real-IP"))
+
+
+@app.before_request
+def guard_outside_callers():
+    """With LIVE_TANK_TOKEN set, this machine is published through a tunnel.
+
+    Requests arriving that way must carry the token, and they only get the
+    API: the site itself stays for viewers on the tank's own network. An
+    instance that proxies a remote tracker never guards, because its visitors
+    are the public.
+    """
+    if remote.enabled() or not local_token():
         return None
+    if not from_outside(request):
+        return None                      # a browser on the lab network
+    if not request.path.startswith("/api/"):
+        abort(404)                       # the tunnel publishes data, not the site
     given = request.headers.get("X-Tank-Token") or request.args.get("t", "")
-    if given != wanted:
+    if given != local_token():
         abort(401)
     return None
 

@@ -58,6 +58,7 @@ all in `live_tank/`:
 ```
 app.py                  Flask routes: site, live video, dashboard APIs
 remote.py               fetching video and data from a tracker on another machine
+tracker_origin.txt      that tracker's public URL, for hosts without env settings
 tracking.py             dashboard payload: live when a camera answers, else sample data
 live_tracking.html      the dashboard page (markup, styles and script in one file)
 live_tank/
@@ -127,7 +128,12 @@ the tracker with two environment variables in the host's settings:
 | Variable | Value |
 | --- | --- |
 | `TRACKER_ORIGIN` | public URL of the tracker, e.g. `https://tank.example.com` |
-| `TRACKER_TOKEN` | the same string as the tracker's `LIVE_TANK_TOKEN` |
+| `TRACKER_TOKEN` | the same string as the tracker's `LIVE_TANK_TOKEN`, if it uses one |
+
+If you cannot set variables on the host, put the tracker's URL in
+`tracker_origin.txt` instead; it is committed, and `TRACKER_ORIGIN` overrides
+it. A machine that has its own camera ignores both and serves its own tracking,
+so the tracker never proxies itself.
 
 The site then fetches the dashboard and video frames from the tracker **server
 side**, so the token never reaches a visitor's browser. Only `requirements.txt`
@@ -146,8 +152,12 @@ for example Cloudflare Tunnel:
 cloudflared tunnel --url http://127.0.0.1:5000          # quick, random URL
 ```
 
-Set `LIVE_TANK_TOKEN` on the tracker before doing this: the tunnel makes it
-reachable by anyone who has the URL.
+A quick tunnel's URL changes every restart; a reserved ngrok domain or a named
+Cloudflare tunnel stays put. Put whichever you use in `tracker_origin.txt`.
+
+Set `LIVE_TANK_TOKEN` on the tracker if the feed should not be public: the
+tunnel makes it reachable by anyone who has the URL. With a token set, tunnel
+traffic must carry it and only the API is served, never the site itself.
 
 ### Video on the public site
 

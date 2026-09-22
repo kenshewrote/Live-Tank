@@ -1,8 +1,17 @@
 import os
+import pathlib
+import tempfile
 import unittest
+import unittest.mock
 
 # The camera stays shut during tests, so the dashboard serves placeholder data.
 os.environ["LIVE_TANK_OFFLINE"] = "1"
+
+import remote
+
+# Tests decide for themselves whether there is a remote tracker, so ignore the
+# committed tracker_origin.txt.
+remote.ORIGIN_FILE = pathlib.Path(tempfile.gettempdir()) / "live-tank-no-such-origin"
 
 from app import app
 
@@ -93,7 +102,9 @@ class LiveViewTests(unittest.TestCase):
 
 
 class TokenGuardTests(unittest.TestCase):
-    """With LIVE_TANK_TOKEN set, /api needs the token but the pages do not."""
+    """LIVE_TANK_TOKEN guards traffic arriving through a tunnel, not the LAN."""
+
+    TUNNELLED = {"X-Forwarded-For": "203.0.113.9"}
 
     def setUp(self):
         self.client = app.test_client()
@@ -102,16 +113,23 @@ class TokenGuardTests(unittest.TestCase):
     def tearDown(self):
         os.environ.pop("LIVE_TANK_TOKEN", None)
 
-    def test_api_requires_the_token(self):
-        self.assertEqual(self.client.get("/api/vision").status_code, 401)
+    def test_tunnelled_api_needs_the_token(self):
+        self.assertEqual(self.client.get("/api/vision", headers=self.TUNNELLED).status_code, 401)
 
-    def test_token_in_header_or_query_is_accepted(self):
-        self.assertEqual(self.client.get("/api/vision", headers={"X-Tank-Token": "secret-token"}).status_code, 200)
-        self.assertEqual(self.client.get("/api/vision?t=secret-token").status_code, 200)
+    def test_tunnelled_token_in_header_or_query_is_accepted(self):
+        headers = {**self.TUNNELLED, "X-Tank-Token": "secret-token"}
+        self.assertEqual(self.client.get("/api/vision", headers=headers).status_code, 200)
+        self.assertEqual(self.client.get("/api/vision?t=secret-token", headers=self.TUNNELLED).status_code, 200)
 
-    def test_pages_stay_open(self):
+    def test_tunnel_does_not_serve_the_site(self):
+        self.assertEqual(self.client.get("/", headers=self.TUNNELLED).status_code, 404)
+        self.assertEqual(self.client.get("/live", headers=self.TUNNELLED).status_code, 404)
+
+    def test_the_lab_network_is_not_asked_for_a_token(self):
         self.assertEqual(self.client.get("/").status_code, 200)
         self.assertEqual(self.client.get("/live").status_code, 200)
+        self.assertEqual(self.client.get("/api/vision").status_code, 200)
+        self.assertEqual(self.client.get("/api/dashboard").status_code, 200)
 
 
 class RemoteTrackerTests(unittest.TestCase):
@@ -123,6 +141,31 @@ class RemoteTrackerTests(unittest.TestCase):
 
     def tearDown(self):
         os.environ.pop("TRACKER_ORIGIN", None)
+
+    def test_a_machine_with_its_own_camera_never_proxies(self):
+        remote._own_camera.cache_clear()
+        try:
+            with unittest.mock.patch.object(remote, "_own_camera", lambda: True):
+                self.assertFalse(remote.enabled())
+        finally:
+            remote._own_camera.cache_clear()
+
+    def test_origin_file_is_used_when_env_is_unset(self):
+        os.environ.pop("TRACKER_ORIGIN", None)
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as handle:
+            handle.write("# a comment\nhttps://tank.example.org/\n")
+            path = handle.name
+        original = remote.ORIGIN_FILE
+        try:
+            remote.ORIGIN_FILE = pathlib.Path(path)
+            self.assertEqual(remote.origin(), "https://tank.example.org")
+        finally:
+            remote.ORIGIN_FILE = original
+            os.unlink(path)
+
+    def test_env_beats_the_file(self):
+        os.environ["TRACKER_ORIGIN"] = "https://from-env.example.com/"
+        self.assertEqual(remote.origin(), "https://from-env.example.com")
 
     def test_config_switches_to_snapshots(self):
         data = self.client.get("/api/config").get_json()
