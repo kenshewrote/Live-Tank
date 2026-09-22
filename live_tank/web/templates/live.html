@@ -8,7 +8,8 @@
 </head>
 <body>
   <main class="stage" id="stage">
-    <img id="video" class="video" src="/api/video.mjpg" alt="Camera 1 with {{ label }} detections">
+    <!-- src is set by live.js, which first asks where the video lives. -->
+    <img id="video" class="video" alt="Camera 1 with {{ label }} detections">
   </main>
 
   <div class="hud" id="hud">

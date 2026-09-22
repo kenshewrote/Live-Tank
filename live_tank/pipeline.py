@@ -26,6 +26,7 @@ MASK_PREVIEW_WIDTH = 384
 SNAPSHOT_WIDTH = 960       # small annotated frame for remote viewers
 SNAPSHOT_QUALITY = 70
 SNAPSHOT_KEEP_S = 15.0     # keep encoding them for this long after the last request
+MASK_KEEP_S = 5.0          # same for the mask preview, which few viewers open
 STALE_AFTER_S = 3.0
 BOOT_ID = str(int(time.time()))  # open pages reload when this changes (server restarted)
 
@@ -67,6 +68,7 @@ class VisionPipeline(threading.Thread):
         self._mask_jpeg = None
         self._snapshot_bytes = None
         self._snapshot_until = 0.0
+        self._mask_until = 0.0
         self._seq = 0
         self._snapshot = {"counts": {"onscreen": 0, "detections": 0, "candidates": 0,
                                      "reflections": 0, "edges": 0, "dark": 0, "reseeds": 0,
@@ -82,6 +84,8 @@ class VisionPipeline(threading.Thread):
             self.layers[name] = bool(on)
 
     def wait_jpeg(self, after_seq, timeout, mask=False):
+        if mask:  # asking for it is what keeps it being encoded
+            self._mask_until = time.time() + MASK_KEEP_S
         with self._cond:
             if not self._cond.wait_for(lambda: self._seq > after_seq, timeout):
                 return None
@@ -177,7 +181,8 @@ class VisionPipeline(threading.Thread):
                    display_mask, self.layers, self.settings.label)
 
         ok, jpeg = cv2.imencode(".jpg", display, [cv2.IMWRITE_JPEG_QUALITY, self.settings.jpeg_quality])
-        mask_jpeg = self._mask_preview(small_mask, blobs, [b for b, _reason in rejected])
+        mask_jpeg = (self._mask_preview(small_mask, blobs, [b for b, _reason in rejected])
+                     if time.time() <= self._mask_until else None)
         snapshot = self._snapshot_jpeg(display)
         self.latency = time.time() - captured_at
         if not ok:

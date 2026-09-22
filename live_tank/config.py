@@ -27,6 +27,7 @@ class Settings:
     output_width: int
     detect_width: int
     jpeg_quality: int
+    stream_fps: float
     max_age: int
     reid_threshold: float
     px_per_cm: float             # 0 keeps speeds in pixels per second
@@ -86,9 +87,14 @@ def load_settings():
         source_label=label,
         live=live,
         label=env("FISH_LABEL", "LMB"),
-        output_width=int(env("OUTPUT_WIDTH", "1920")),
+        # MJPEG re-sends a whole frame every frame, so width, quality and rate
+        # multiply straight into the bandwidth a remote viewer needs. These
+        # defaults measure around 3-4 Mbit/s, which a home upload can carry;
+        # raise them when everyone watching is on the tank's own network.
+        output_width=int(env("OUTPUT_WIDTH", "1280")),
         detect_width=int(env("DETECT_WIDTH", "640")),
-        jpeg_quality=int(env("JPEG_QUALITY", "82")),
+        jpeg_quality=int(env("JPEG_QUALITY", "60")),
+        stream_fps=float(env("STREAM_FPS", "12")),
         max_age=int(env("TRACK_MAX_AGE", "40")),
         reid_threshold=float(env("REID_THRESHOLD", "0.15")),
         px_per_cm=float(env("PX_PER_CM", "0")),

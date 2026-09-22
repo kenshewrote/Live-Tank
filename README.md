@@ -87,6 +87,8 @@ See `.env.example` for the full list. The common ones:
 | `SOURCE` | use a video file or another URL instead of the camera |
 | `FISH_LABEL` | label drawn on each fish (default `LMB`) |
 | `PX_PER_CM` | set once the tank is calibrated to report cm/s instead of px/s |
+| `OUTPUT_WIDTH`, `JPEG_QUALITY`, `STREAM_FPS` | size, quality and rate of the video sent to viewers |
+| `DETECT_WIDTH` | width the detector works at; the main cost per frame |
 | `LIVE_TANK_OFFLINE` | `1` never opens the camera (used by the tests) |
 | `LIVE_TANK_TOKEN` | on the tracker: token every `/api` call must carry |
 | `TRACKER_ORIGIN`, `TRACKER_TOKEN` | on the public site: where the tracker is, and its token |
@@ -95,9 +97,10 @@ See `.env.example` for the full list. The common ones:
 
 | Route | Returns |
 | --- | --- |
-| `GET /api/config` | whether this instance streams video or serves snapshots |
+| `GET /api/config` | where the page should get video, and a ticket to open it |
+| `GET /api/stream-ticket` | a fresh ticket, for reopening a dropped stream |
 | `GET /api/video.mjpg` | annotated camera stream (MJPEG), tracker machine only |
-| `GET /api/snapshot.jpg` | latest annotated frame, one JPEG |
+| `GET /api/snapshot.jpg` | latest annotated frame, one JPEG (fallback only) |
 | `GET /api/mask.mjpg` | detector foreground mask (MJPEG) |
 | `GET /api/vision` | tracker state: source, counts, per-fish rows, layers |
 | `POST /api/layers` | turn overlay layers on and off, e.g. `{"trails": false}` |
@@ -161,13 +164,24 @@ traffic must carry it and only the API is served, never the site itself.
 
 ### Video on the public site
 
-A serverless host cannot relay a continuous MJPEG stream, so `/api/config`
-tells the page which way to take the video:
+A serverless host cannot relay a continuous MJPEG stream, and relaying single
+frames costs a round trip each — about 1.4 frames a second, every one of them
+crossing the internet twice. So the public site does not carry the video at
+all. `/api/config` tells the page where to get it:
 
 - **`mjpeg`** — the tracker itself, or any host on the tank's network: the full
-  stream at camera rate.
-- **`snapshot`** — a site proxying a remote tracker: one annotated frame roughly
-  every 0.7 s, which keeps cloud bandwidth sane.
+  stream, same origin.
+- **`direct`** — a public site: the page opens the tracker's own URL and the
+  video never passes through the site. `/api/config` and `/api/stream-ticket`
+  supply the tracker's origin and a ticket to open it with.
+- **`snapshot`** — the old relayed single frames. The page falls back to this by
+  itself if the direct stream keeps failing.
+
+A ticket is the tracker's token narrowed down: the site signs an expiry with
+`TRACKER_TOKEN` and the tracker accepts the result for `/api/video.mjpg` and
+`/api/mask.mjpg` only, until it runs out. A ticket that leaks cannot change
+layers, trigger a relearn or read the tracking data, and stops working within
+the quarter hour. The token itself never reaches a browser.
 
 Because the tracker keeps state in memory, run a single worker process.
 

@@ -11,10 +11,11 @@ The same app runs in two places:
 Routes
   /                     the dashboard site (live_tracking.html)
   /live                 full-screen camera view with the tracking overlay
-  /api/config           how this instance serves video: stream or snapshots
+  /api/config           where the page should get video, and its ticket
+  /api/stream-ticket    a fresh ticket for reopening the stream
   /api/video.mjpg       annotated camera stream (tracker machine only)
   /api/mask.mjpg        detector's foreground mask (tracker machine only)
-  /api/snapshot.jpg     latest annotated frame, one JPEG
+  /api/snapshot.jpg     latest annotated frame, one JPEG (fallback)
   /api/vision           tracker state for the live panel
   /api/layers           POST: turn overlay layers on and off
   /api/relearn          POST: relearn the empty tank background
@@ -31,6 +32,7 @@ from flask import Flask, Response, abort, jsonify, render_template, request, sen
 from flask_cors import CORS
 
 import remote
+import tickets
 import tracking
 from live_tank.service import service
 
@@ -77,9 +79,13 @@ def guard_outside_callers():
     if not request.path.startswith("/api/"):
         abort(404)                       # the tunnel publishes data, not the site
     given = request.headers.get("X-Tank-Token") or request.args.get("t", "")
-    if given != local_token():
-        abort(401)
-    return None
+    if given == local_token():
+        return None
+    # A browser sent here by the public site carries a ticket instead: good for
+    # the video for a few minutes, never for the control endpoints.
+    if request.path in tickets.VIDEO_PATHS and tickets.verify(local_token(), given):
+        return None
+    abort(401)
 
 
 # ---- the site ---------------------------------------------------------------
@@ -94,20 +100,48 @@ def live_view():
 
 
 # ---- live camera ------------------------------------------------------------
+MAX_STREAM_FPS = 60.0
+
+
+def requested_fps():
+    """Frame rate for this viewer; ?fps= lets one on the LAN ask for more."""
+    try:
+        return min(max(float(request.args["fps"]), 0.0), MAX_STREAM_FPS)
+    except (KeyError, ValueError):
+        return None                         # the configured default
+
+
 def _stream(mask):
     if remote.enabled():                    # a serverless host cannot relay a stream
         abort(404)
-    return Response(service.frames(mask=mask),
+    return Response(service.frames(mask=mask, fps=requested_fps()),
                     mimetype="multipart/x-mixed-replace; boundary=frame",
                     headers={"Cache-Control": "no-store"})
 
 
+def stream_plan():
+    """Where the browser should get its video.
+
+    On the tracker itself the stream is simply local. On the public site it is
+    on the tracker's own URL: relaying it here would cost a round trip per
+    frame, so the page is sent straight there with a ticket instead.
+    """
+    if not remote.enabled():
+        return {"stream": "mjpeg", "origin": "", "ticket": ""}
+    return {"stream": "direct", "origin": remote.origin(), "ticket": tickets.mint(remote.token())}
+
+
 @app.route("/api/config")
 def api_config():
-    """Tells the page whether to open the stream or poll snapshots."""
-    return jsonify({"stream": "snapshot" if remote.enabled() else "mjpeg",
-                    "remote": remote.enabled(),
+    """Tells the page where to open the stream, and how to authenticate to it."""
+    return jsonify({**stream_plan(), "remote": remote.enabled(),
                     "label": service.settings.label})
+
+
+@app.route("/api/stream-ticket")
+def api_stream_ticket():
+    """A fresh ticket. The page asks for one whenever it reopens the stream."""
+    return jsonify(stream_plan())
 
 
 @app.route("/api/video.mjpg")

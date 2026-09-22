@@ -81,18 +81,28 @@ class VisionService:
                                "status": "NO CAMERA"}}
         return {"configured": True, "error": self.error, **pipeline.state()}
 
-    def frames(self, mask=False):
-        """Yield multipart MJPEG chunks of the annotated video (or the mask)."""
+    def frames(self, mask=False, fps=None):
+        """Yield multipart MJPEG chunks of the annotated video (or the mask).
+
+        Frames past `fps` are dropped rather than queued, so a viewer on a thin
+        link falls behind in rate instead of in time.
+        """
         pipeline = self.start()
         if pipeline is None:
             return
+        if fps is None:
+            fps = self.settings.stream_fps
+        period = 1.0 / fps if fps > 0 else 0.0
         seq = 0
+        next_due = 0.0
         while True:
             got = pipeline.wait_jpeg(seq, timeout=5.0, mask=mask)
             if got is None:
                 continue
             seq, jpeg = got
-            if jpeg:
+            now = time.monotonic()
+            if jpeg and now >= next_due:
+                next_due = max(now, next_due) + period
                 yield (b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
                        + str(len(jpeg)).encode() + b"\r\n\r\n" + jpeg + b"\r\n")
 

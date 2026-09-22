@@ -964,9 +964,23 @@ setInterval(loadDashboard, 10000);
   const countText = document.getElementById('liveCount');
   const STREAMING = ['LIVE', 'PLAYBACK'];
   const SNAPSHOT_EVERY_MS = 700;
+  const RETRY_MS = 1500;
+  const SETTLED_MS = 30000;   /* a stream that lasted this long was working */
   let streaming = false;
-  let mode = 'mjpeg';       /* 'snapshot' when the site proxies a remote tracker */
+  /* 'mjpeg' streams from this server, 'direct' from the tracker's own URL.
+     'snapshot' relays single frames through this server: a frame costs a round
+     trip, so it is only a fallback for when the tracker cannot be reached. */
+  let mode = 'mjpeg';
+  let origin = '';
+  let ticket = '';
   let snapshotTimer = null;
+  let failures = 0;
+  let lastFailureAt = 0;
+
+  function streamUrl() {
+    if (mode !== 'direct') return '/api/video.mjpg';
+    return origin + '/api/video.mjpg' + (ticket ? '?t=' + encodeURIComponent(ticket) : '');
+  }
 
   function show(message) {
     note.innerHTML = '<b>' + message + '</b>';
@@ -975,7 +989,17 @@ setInterval(loadDashboard, 10000);
     if (streaming) { video.hidden = true; video.removeAttribute('src'); streaming = false; }
   }
 
-  /* A serverless host cannot relay the stream, so it serves single frames. */
+  function refreshTicket() {
+    if (mode !== 'direct') return Promise.resolve();
+    return fetch('/api/stream-ticket', { cache: 'no-store' })
+      .then(function (res) { return res.ok ? res.json() : {}; })
+      .then(function (plan) {
+        if (plan.origin) origin = plan.origin;
+        if (typeof plan.ticket === 'string') ticket = plan.ticket;
+      })
+      .catch(function () { /* keep the ticket we have and let the retry fail */ });
+  }
+
   function startVideo() {
     if (streaming) return;
     streaming = true;
@@ -984,9 +1008,22 @@ setInterval(loadDashboard, 10000);
       tick();
       snapshotTimer = setInterval(tick, SNAPSHOT_EVERY_MS);
     } else {
-      video.src = '/api/video.mjpg';
+      video.src = streamUrl();
     }
   }
+
+  /* A dropped stream is normal; a ticket also expires eventually. Reopen with
+     a fresh one, and only give up on the direct route if it keeps failing. */
+  video.addEventListener('error', function () {
+    if (!streaming || mode === 'snapshot') return;
+    const now = Date.now();
+    failures = now - lastFailureAt > SETTLED_MS ? 1 : failures + 1;
+    lastFailureAt = now;
+    streaming = false;
+    video.removeAttribute('src');
+    if (mode === 'direct' && failures >= 3) mode = 'snapshot';
+    setTimeout(function () { refreshTicket().then(startVideo); }, RETRY_MS);
+  });
 
   function apply(state) {
     if (!state.configured) {
@@ -1035,7 +1072,11 @@ setInterval(loadDashboard, 10000);
 
   fetch('/api/config', { cache: 'no-store' })
     .then(function (res) { return res.ok ? res.json() : {}; })
-    .then(function (config) { if (config.stream) mode = config.stream; })
+    .then(function (config) {
+      if (config.stream) mode = config.stream;
+      origin = config.origin || '';
+      ticket = config.ticket || '';
+    })
     .catch(function () { /* stay on the stream */ })
     .then(poll);
 })();

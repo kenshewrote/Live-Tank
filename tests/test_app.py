@@ -1,6 +1,7 @@
 import os
 import pathlib
 import tempfile
+import time
 import unittest
 import unittest.mock
 
@@ -8,6 +9,7 @@ import unittest.mock
 os.environ["LIVE_TANK_OFFLINE"] = "1"
 
 import remote
+import tickets
 
 # Tests decide for themselves whether there is a remote tracker, so ignore the
 # committed tracker_origin.txt.
@@ -79,7 +81,10 @@ class LiveViewTests(unittest.TestCase):
         res = self.client.get("/live")
         self.assertEqual(res.status_code, 200)
         html = res.get_data(as_text=True)
-        self.assertIn("/api/video.mjpg", html)
+        # The video's src is left to live.js, which first asks /api/config
+        # whether the stream is here or on a tracker elsewhere.
+        self.assertIn('id="video"', html)
+        self.assertNotIn('src="/api/video.mjpg"', html)
         self.assertIn('id="spark"', html)
         self.assertIn('id="mask"', html)
 
@@ -132,6 +137,50 @@ class TokenGuardTests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/dashboard").status_code, 200)
 
 
+class StreamTicketTests(unittest.TestCase):
+    """A ticket lets a browser take the video without holding the real token."""
+
+    TUNNELLED = {"X-Forwarded-For": "203.0.113.9"}
+
+    def setUp(self):
+        self.client = app.test_client()
+        os.environ["LIVE_TANK_TOKEN"] = "secret-token"
+
+    def tearDown(self):
+        os.environ.pop("LIVE_TANK_TOKEN", None)
+
+    def get(self, path, ticket):
+        return self.client.get(f"{path}?t={ticket}", headers=self.TUNNELLED)
+
+    def test_a_ticket_opens_the_video(self):
+        ticket = tickets.mint("secret-token")
+        # 200, not 401: past the guard. The body is empty only because the
+        # camera is shut for the tests.
+        self.assertEqual(self.get("/api/video.mjpg", ticket).status_code, 200)
+        self.assertEqual(self.get("/api/mask.mjpg", ticket).status_code, 200)
+
+    def test_a_ticket_does_not_open_anything_else(self):
+        ticket = tickets.mint("secret-token")
+        self.assertEqual(self.get("/api/vision", ticket).status_code, 401)
+        self.assertEqual(self.client.post("/api/relearn", query_string={"t": ticket},
+                                          headers=self.TUNNELLED).status_code, 401)
+
+    def test_an_expired_ticket_is_refused(self):
+        self.assertEqual(self.get("/api/video.mjpg", tickets.mint("secret-token", ttl=-1)).status_code, 401)
+
+    def test_a_ticket_signed_with_another_secret_is_refused(self):
+        self.assertEqual(self.get("/api/video.mjpg", tickets.mint("wrong-secret")).status_code, 401)
+
+    def test_a_forged_ticket_is_refused(self):
+        expires_at = int(time.time()) + 600
+        self.assertEqual(self.get("/api/video.mjpg", f"{expires_at}.not-a-signature").status_code, 401)
+        self.assertEqual(self.get("/api/video.mjpg", "gibberish").status_code, 401)
+
+    def test_tickets_need_a_secret(self):
+        self.assertEqual(tickets.mint(""), "")
+        self.assertFalse(tickets.verify("", "anything"))
+
+
 class RemoteTrackerTests(unittest.TestCase):
     """With TRACKER_ORIGIN set the site proxies instead of tracking itself."""
 
@@ -167,12 +216,24 @@ class RemoteTrackerTests(unittest.TestCase):
         os.environ["TRACKER_ORIGIN"] = "https://from-env.example.com/"
         self.assertEqual(remote.origin(), "https://from-env.example.com")
 
-    def test_config_switches_to_snapshots(self):
+    def test_config_sends_the_page_straight_to_the_tracker(self):
         data = self.client.get("/api/config").get_json()
-        self.assertEqual(data["stream"], "snapshot")
+        self.assertEqual(data["stream"], "direct")
+        self.assertEqual(data["origin"], "https://tank.example.com")
         self.assertTrue(data["remote"])
 
-    def test_stream_routes_are_not_served(self):
+    def test_stream_ticket_is_issued_for_the_tracker(self):
+        os.environ["TRACKER_TOKEN"] = "shared-secret"
+        try:
+            data = self.client.get("/api/stream-ticket").get_json()
+            self.assertEqual(data["origin"], "https://tank.example.com")
+            self.assertTrue(tickets.verify("shared-secret", data["ticket"]))
+            self.assertFalse(tickets.verify("another-secret", data["ticket"]))
+        finally:
+            os.environ.pop("TRACKER_TOKEN", None)
+
+    def test_stream_routes_are_not_relayed(self):
+        """The public site never carries the video itself; the browser goes direct."""
         self.assertEqual(self.client.get("/api/video.mjpg").status_code, 404)
         self.assertEqual(self.client.get("/api/mask.mjpg").status_code, 404)
 

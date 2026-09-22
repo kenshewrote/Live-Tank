@@ -10,6 +10,26 @@
   let layersSynced = false;
   let history = [];
 
+  // ---- where the video comes from -----------------------------------------
+  // This page may be served by a host that cannot see the tank. /api/config
+  // then points at the tracker's own URL and hands over a ticket to open it
+  // with, so the video never makes a detour through the public site.
+  let videoOrigin = "";
+  let ticket = "";
+  let planLoaded = false;
+  const videoUrl = (path) =>
+    videoOrigin + path + (ticket ? (path.includes("?") ? "&" : "?") + "t=" + encodeURIComponent(ticket) : "");
+
+  async function loadStreamPlan(path = "/api/config") {
+    try {
+      const res = await fetch(path, { cache: "no-store" });
+      if (!res.ok) return;
+      const plan = await res.json();
+      if (plan.origin) videoOrigin = plan.origin;
+      if (typeof plan.ticket === "string") ticket = plan.ticket;
+    } catch { /* same-origin stream is the sensible default */ }
+  }
+
   // Panel sizes and minimized state are remembered per browser.
   const prefs = (() => {
     try { return JSON.parse(localStorage.getItem("lmb-vision-panels") || "{}"); } catch { return {}; }
@@ -239,14 +259,15 @@
     });
   });
 
-  // Only pull the mask's MJPEG stream while it is expanded.
+  // Only pull the mask's MJPEG stream while it is expanded, and never before
+  // we know which server to pull it from.
   function syncMask() {
+    if (!planLoaded) return;
     const img = $("mask");
     const visible = !panels.mask.el.classList.contains("collapsed");
-    if (visible && !img.getAttribute("src")) img.src = "/api/mask.mjpg";
+    if (visible && !img.getAttribute("src")) img.src = videoUrl("/api/mask.mjpg");
     if (!visible && img.getAttribute("src")) img.removeAttribute("src");
   }
-  syncMask();
 
   // ---- bottom-right dock: eye slides the tools out and back ----------------------
   const dock = document.querySelector(".dock");
@@ -314,10 +335,14 @@
 
   window.addEventListener("resize", () => renderSpark());
 
-  // Keep the video alive if the MJPEG connection drops.
+  // Keep the video alive if the MJPEG connection drops. A ticket expires, so
+  // take a fresh one before reopening.
   const video = $("video");
   video.addEventListener("error", () => {
-    setTimeout(() => { video.src = `/api/video.mjpg?r=${Date.now()}`; }, 1500);
+    setTimeout(async () => {
+      await loadStreamPlan("/api/stream-ticket");
+      video.src = videoUrl(`/api/video.mjpg?r=${Date.now()}`);
+    }, 1500);
   });
 
   // Hide the cursor when idle so the stream stays clean.
@@ -328,5 +353,11 @@
     idleTimer = setTimeout(() => body.classList.add("idle"), 2500);
   });
 
-  poll();
+  (async () => {
+    await loadStreamPlan();
+    planLoaded = true;
+    video.src = videoUrl("/api/video.mjpg");
+    syncMask();
+    poll();
+  })();
 })();
