@@ -39,15 +39,47 @@
   };
 
   // ---- polling ------------------------------------------------------------
+  // One timer, re-armed only after a response. A fixed interval would stack
+  // requests up whenever the tracker is slow, and would keep firing in a tab
+  // nobody is looking at — this page may be served by a host that bills per
+  // request.
+  const VISION_EVERY_MS = 2000;
+  const VISION_MAX_BACKOFF_MS = 30000;
+  let visionDelay = VISION_EVERY_MS;
+  let visionTimer = null;
+  let visionInFlight = false;
+
+  function scheduleVision(delay) {
+    clearTimeout(visionTimer);
+    visionTimer = setTimeout(poll, delay);
+  }
+
   async function poll() {
+    if (visionInFlight) return;
+    if (document.visibilityState === "hidden") {
+      scheduleVision(VISION_EVERY_MS);
+      return;
+    }
+    visionInFlight = true;
     try {
       const res = await fetch("/api/vision", { cache: "no-store" });
-      if (res.ok) render(await res.json());
+      if (!res.ok) throw new Error(`vision ${res.status}`);
+      render(await res.json());
+      visionDelay = VISION_EVERY_MS;
     } catch {
       showOffline("App server unreachable", "Is the LMB Vision process still running?");
+      visionDelay = Math.min(visionDelay * 2, VISION_MAX_BACKOFF_MS);
+    } finally {
+      visionInFlight = false;
     }
-    setTimeout(poll, 500);
+    scheduleVision(visionDelay);
   }
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible") return;
+    visionDelay = VISION_EVERY_MS;   // a fresh look deserves a fresh reading
+    scheduleVision(0);
+  });
 
   function render(s) {
     // The server restarted with a newer version: load it.

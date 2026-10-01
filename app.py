@@ -46,6 +46,32 @@ CORS(app)
 # sample data. No-op when no camera is configured or LIVE_TANK_OFFLINE=1.
 service.start()
 
+# Cache policies for the proxying instance only. Every request there is a
+# function invocation that also waits on the tunnel, so letting the CDN serve
+# one upstream fetch to many viewers is the difference between per-viewer cost
+# and per-tank cost. Kept well under the polling intervals so figures stay
+# current. On the tracker itself the data is local and free, and caching it
+# would only serve stale numbers to the lab.
+VISION_CACHE = "public, s-maxage=2, stale-while-revalidate=5"
+DASHBOARD_CACHE = "public, s-maxage=10, stale-while-revalidate=20"
+# A tracker that is merely unreachable may be back in a moment; don't pin that.
+UNREACHABLE_CACHE = "public, s-maxage=2, stale-while-revalidate=2"
+
+
+def shared(payload, policy):
+    """Let the CDN hand one proxied response to several viewers."""
+    response = jsonify(payload)
+    if remote.enabled():
+        response.headers["Cache-Control"] = policy
+    return response
+
+
+def uncached(payload):
+    """A response no cache may keep: it carries a ticket with its own expiry."""
+    response = jsonify(payload)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
 
 def local_token():
     """Token this instance demands from outside callers (tracker machine)."""
@@ -134,14 +160,14 @@ def stream_plan():
 @app.route("/api/config")
 def api_config():
     """Tells the page where to open the stream, and how to authenticate to it."""
-    return jsonify({**stream_plan(), "remote": remote.enabled(),
-                    "label": service.settings.label})
+    return uncached({**stream_plan(), "remote": remote.enabled(),
+                     "label": service.settings.label})
 
 
 @app.route("/api/stream-ticket")
 def api_stream_ticket():
     """A fresh ticket. The page asks for one whenever it reopens the stream."""
-    return jsonify(stream_plan())
+    return uncached(stream_plan())
 
 
 @app.route("/api/video.mjpg")
@@ -172,8 +198,11 @@ def api_snapshot():
 def api_vision():
     if remote.enabled():
         state = remote.fetch_json("/api/vision")
-        return jsonify(state or {"configured": False, "error": "tracker unreachable",
-                                 "source": {"name": "Tracker offline", "status": "NO CAMERA"}})
+        if state is None:
+            return shared({"configured": False, "error": "tracker unreachable",
+                           "source": {"name": "Tracker offline", "status": "NO CAMERA"}},
+                          UNREACHABLE_CACHE)
+        return shared(state, VISION_CACHE)
     return jsonify(service.state())
 
 
@@ -194,17 +223,17 @@ def api_relearn():
 @app.route("/api/dashboard")
 def api_dashboard():
     """Full page payload. The frontend loads this once on boot."""
-    return jsonify(tracking.get_snapshot())
+    return shared(tracking.get_snapshot(), DASHBOARD_CACHE)
 
 
 @app.route("/api/stats")
 def api_stats():
-    return jsonify(tracking.get_stats())
+    return shared(tracking.get_stats(), DASHBOARD_CACHE)
 
 
 @app.route("/api/metrics")
 def api_metrics():
-    return jsonify(tracking.get_metrics())
+    return shared(tracking.get_metrics(), DASHBOARD_CACHE)
 
 
 @app.route("/api/metrics/<metric_id>")
@@ -212,17 +241,17 @@ def api_metric(metric_id):
     metric = tracking.get_metric(metric_id)
     if metric is None:
         return jsonify({"error": "unknown metric", "id": metric_id}), 404
-    return jsonify({"id": metric_id, **metric})
+    return shared({"id": metric_id, **metric}, DASHBOARD_CACHE)
 
 
 @app.route("/api/tracks")
 def api_tracks():
-    return jsonify(tracking.get_tracks())
+    return shared(tracking.get_tracks(), DASHBOARD_CACHE)
 
 
 @app.route("/api/activity")
 def api_activity():
-    return jsonify(tracking.get_activity())
+    return shared(tracking.get_activity(), DASHBOARD_CACHE)
 
 
 if __name__ == "__main__":

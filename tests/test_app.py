@@ -105,6 +105,12 @@ class LiveViewTests(unittest.TestCase):
     def test_snapshot_unavailable_without_a_camera(self):
         self.assertEqual(self.client.get("/api/snapshot.jpg").status_code, 503)
 
+    def test_the_tracker_does_not_cache_its_own_data(self):
+        """Caching is for the proxying site; here the data is local and free."""
+        for path in ("/api/vision", "/api/dashboard", "/api/stats", "/api/tracks"):
+            cache = self.client.get(path).headers.get("Cache-Control", "")
+            self.assertNotIn("s-maxage", cache, f"{path} should not be cached on the tracker")
+
 
 class TokenGuardTests(unittest.TestCase):
     """LIVE_TANK_TOKEN guards traffic arriving through a tunnel, not the LAN."""
@@ -246,6 +252,38 @@ class RemoteTrackerTests(unittest.TestCase):
     def test_dashboard_falls_back_to_sample_data(self):
         data = self.client.get("/api/dashboard").get_json()
         self.assertEqual(data["source"], "placeholder")
+
+    # ---- CDN caching: one proxied fetch should serve many viewers -----------
+    def test_proxied_vision_is_cached_briefly(self):
+        live = {"configured": True, "source": {"name": "cam", "status": "LIVE"}}
+        with unittest.mock.patch.object(remote, "fetch_json", lambda *a, **k: live):
+            cache = self.client.get("/api/vision").headers.get("Cache-Control", "")
+        self.assertIn("s-maxage=2", cache)
+        self.assertIn("stale-while-revalidate", cache)
+
+    def test_unreachable_tracker_is_not_cached_for_long(self):
+        """It may be back in a moment, so the failure must not stick."""
+        cache = self.client.get("/api/vision").headers.get("Cache-Control", "")
+        self.assertIn("s-maxage=2", cache)
+
+    def test_proxied_dashboard_routes_are_cached(self):
+        for path in ("/api/dashboard", "/api/stats", "/api/metrics",
+                     "/api/metrics/view", "/api/tracks", "/api/activity"):
+            cache = self.client.get(path).headers.get("Cache-Control", "")
+            self.assertIn("s-maxage=10", cache, f"{path} is not shareable")
+
+    def test_tickets_are_never_cached(self):
+        """A shared ticket would hand several viewers one expiry."""
+        for path in ("/api/config", "/api/stream-ticket"):
+            cache = self.client.get(path).headers.get("Cache-Control", "")
+            self.assertIn("no-store", cache, f"{path} is cacheable")
+            self.assertNotIn("s-maxage", cache, f"{path} is shareable")
+
+    def test_snapshot_relay_is_never_cached(self):
+        with unittest.mock.patch.object(remote, "fetch", lambda *a, **k: (b"\xff\xd8", "image/jpeg")):
+            cache = self.client.get("/api/snapshot.jpg").headers.get("Cache-Control", "")
+        self.assertIn("no-store", cache)
+        self.assertNotIn("s-maxage", cache)
 
 
 class TrackingApiTests(unittest.TestCase):
