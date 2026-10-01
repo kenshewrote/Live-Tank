@@ -16,7 +16,9 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-TIMEOUT_S = 10
+# Short on purpose: a dead tunnel otherwise holds a serverless function open for
+# the whole wait, once per poll, per viewer.
+TIMEOUT_S = 4
 ORIGIN_FILE = Path(__file__).resolve().parent / "tracker_origin.txt"
 
 

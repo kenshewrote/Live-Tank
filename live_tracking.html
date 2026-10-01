@@ -940,20 +940,55 @@ document.querySelector('.kpi-row').addEventListener('keydown', function (e) {
   selectMetric(next.getAttribute('data-metric'), true);
 });
 
-/* The tracker keeps running, so refresh the readout rather than loading once. */
+/* The tracker keeps running, so refresh the readout rather than loading once.
+   One timer, re-armed after each response rather than a fixed interval: that
+   way a slow tracker cannot stack requests up, and a tab left open in the
+   background stops asking entirely. Chart points are 10 s apart, so polling
+   faster than that shows nothing new. */
+const DASHBOARD_EVERY_MS = 10000;
+const DASHBOARD_MAX_BACKOFF_MS = 60000;
+let dashboardDelay = DASHBOARD_EVERY_MS;
+let dashboardTimer = null;
+let dashboardInFlight = false;
+
+function scheduleDashboard(delay) {
+  clearTimeout(dashboardTimer);
+  dashboardTimer = setTimeout(loadDashboard, delay);
+}
+
 function loadDashboard() {
+  if (dashboardInFlight) return Promise.resolve();
   const modal = document.getElementById('kpiModal');
-  if (modal && !modal.hidden) return Promise.resolve();   // don't redraw under an open panel
+  // Nothing to show: no one is looking, or a panel is open over the figures.
+  if (document.visibilityState === 'hidden' || (modal && !modal.hidden)) {
+    scheduleDashboard(DASHBOARD_EVERY_MS);
+    return Promise.resolve();
+  }
+  dashboardInFlight = true;
   return fetch(API.dashboard, { cache: 'no-store' })
     .then(function (res) { if (!res.ok) throw new Error('dashboard ' + res.status); return res.json(); })
-    .then(applyDashboard)
+    .then(function (data) {
+      applyDashboard(data);
+      dashboardDelay = DASHBOARD_EVERY_MS;
+    })
     .catch(function () {
       document.getElementById('updatedChip').innerHTML =
         '<span class="dash-chip-dot" aria-hidden="true"></span>Model feed unavailable';
+      dashboardDelay = Math.min(dashboardDelay * 2, DASHBOARD_MAX_BACKOFF_MS);
+    })
+    .then(function () {
+      dashboardInFlight = false;
+      scheduleDashboard(dashboardDelay);
     });
 }
+
+document.addEventListener('visibilitychange', function () {
+  if (document.visibilityState !== 'visible') return;
+  dashboardDelay = DASHBOARD_EVERY_MS;
+  scheduleDashboard(0);
+});
+
 loadDashboard();
-setInterval(loadDashboard, 10000);
 
 /* Live camera panel: start the video once the tracker reports frames. */
 (function () {
@@ -963,29 +998,46 @@ setInterval(loadDashboard, 10000);
   const statusText = document.getElementById('liveStatus');
   const countText = document.getElementById('liveCount');
   const STREAMING = ['LIVE', 'PLAYBACK'];
-  const SNAPSHOT_EVERY_MS = 700;
+  const VISION_EVERY_MS = 2000;
+  const VISION_MAX_BACKOFF_MS = 30000;
+  const SNAPSHOT_EVERY_MS = 3000;
+  const SNAPSHOT_MAX_BACKOFF_MS = 30000;
+  const DIRECT_RETRY_AFTER_MS = 60000;   /* leave snapshot mode and try direct again */
   const RETRY_MS = 1500;
   const SETTLED_MS = 30000;   /* a stream that lasted this long was working */
   let streaming = false;
+  let reconnecting = false;   /* a reconnect is pending; don't let the poll jump it */
   /* 'mjpeg' streams from this server, 'direct' from the tracker's own URL.
      'snapshot' relays single frames through this server: a frame costs a round
      trip, so it is only a fallback for when the tracker cannot be reached. */
   let mode = 'mjpeg';
+  let plannedMode = 'mjpeg';  /* what /api/config asked for, to return to */
   let origin = '';
   let ticket = '';
+  let trackerLive = false;    /* last /api/vision said the camera is streaming */
   let snapshotTimer = null;
+  let snapshotDelay = SNAPSHOT_EVERY_MS;
+  let snapshotSince = 0;
   let failures = 0;
   let lastFailureAt = 0;
+  let visionDelay = VISION_EVERY_MS;
+  let visionTimer = null;
+  let visionInFlight = false;
 
   function streamUrl() {
     if (mode !== 'direct') return '/api/video.mjpg';
     return origin + '/api/video.mjpg' + (ticket ? '?t=' + encodeURIComponent(ticket) : '');
   }
 
+  function stopSnapshots() {
+    clearTimeout(snapshotTimer);
+    snapshotTimer = null;
+  }
+
   function show(message) {
     note.innerHTML = '<b>' + message + '</b>';
     note.hidden = false;
-    if (snapshotTimer) { clearInterval(snapshotTimer); snapshotTimer = null; }
+    stopSnapshots();
     if (streaming) { video.hidden = true; video.removeAttribute('src'); streaming = false; }
   }
 
@@ -1000,29 +1052,83 @@ setInterval(loadDashboard, 10000);
       .catch(function () { /* keep the ticket we have and let the retry fail */ });
   }
 
+  function scheduleSnapshot(delay) {
+    clearTimeout(snapshotTimer);
+    snapshotTimer = setTimeout(snapshotTick, delay);
+  }
+
+  /* Every snapshot is a whole JPEG relayed through this server — one internet
+     round trip per frame — so this loop stays slow, stops while the tab is
+     hidden, and hands back to the direct stream once the tunnel has had time
+     to recover. Without that last part a single blip left every viewer pulling
+     images through here for the rest of the day. */
+  function snapshotTick() {
+    if (mode !== 'snapshot' || !streaming) return;
+    if (document.visibilityState === 'hidden') {
+      scheduleSnapshot(SNAPSHOT_EVERY_MS);
+      return;
+    }
+    if (plannedMode === 'direct' && Date.now() - snapshotSince > DIRECT_RETRY_AFTER_MS) {
+      stopSnapshots();
+      mode = plannedMode;
+      failures = 0;
+      snapshotSince = 0;
+      streaming = false;
+      video.removeAttribute('src');
+      reconnect();
+      return;
+    }
+    video.src = '/api/snapshot.jpg?ts=' + Date.now();
+    scheduleSnapshot(snapshotDelay);
+  }
+
+  /* Reopening always goes through here, so the 2-second poll cannot start the
+     video with a stale ticket while a reconnect is still pending. */
+  function reconnect() {
+    reconnecting = true;
+    setTimeout(function () {
+      refreshTicket().then(function () {
+        reconnecting = false;
+        startVideo();
+      });
+    }, RETRY_MS);
+  }
+
   function startVideo() {
-    if (streaming) return;
+    if (streaming || reconnecting) return;
     streaming = true;
     if (mode === 'snapshot') {
-      const tick = function () { video.src = '/api/snapshot.jpg?ts=' + Date.now(); };
-      tick();
-      snapshotTimer = setInterval(tick, SNAPSHOT_EVERY_MS);
+      snapshotSince = snapshotSince || Date.now();
+      snapshotDelay = SNAPSHOT_EVERY_MS;
+      snapshotTick();
     } else {
       video.src = streamUrl();
     }
   }
 
-  /* A dropped stream is normal; a ticket also expires eventually. Reopen with
-     a fresh one, and only give up on the direct route if it keeps failing. */
+  /* A dropped stream is normal; a ticket also expires eventually. Reopen with a
+     fresh one, and only fall back to relayed snapshots if the direct route
+     keeps failing *and* the tracker is actually alive — when it is down,
+     snapshots fail too, so falling back just moves the failure onto this
+     server's bill. */
   video.addEventListener('error', function () {
-    if (!streaming || mode === 'snapshot') return;
+    if (!streaming) return;
     const now = Date.now();
+    if (mode === 'snapshot') {
+      snapshotDelay = Math.min(snapshotDelay * 2, SNAPSHOT_MAX_BACKOFF_MS);
+      scheduleSnapshot(snapshotDelay);
+      return;
+    }
     failures = now - lastFailureAt > SETTLED_MS ? 1 : failures + 1;
     lastFailureAt = now;
     streaming = false;
     video.removeAttribute('src');
-    if (mode === 'direct' && failures >= 3) mode = 'snapshot';
-    setTimeout(function () { refreshTicket().then(startVideo); }, RETRY_MS);
+    if (mode === 'direct' && failures >= 3 && trackerLive) {
+      mode = 'snapshot';
+      snapshotSince = now;
+      snapshotDelay = SNAPSHOT_EVERY_MS;
+    }
+    reconnect();
   });
 
   function apply(state) {
@@ -1037,6 +1143,7 @@ setInterval(loadDashboard, 10000);
     const vision = state.vision || {};
     const counts = state.counts || {};
     const live = STREAMING.indexOf(source.status) >= 0;
+    trackerLive = live;
 
     if (live) {
       startVideo();
@@ -1057,23 +1164,50 @@ setInterval(loadDashboard, 10000);
     countText.textContent = (counts.onscreen || 0) + ' in view · ' + (counts.known || 0) + ' identified';
   }
 
-  function poll() {
-    fetch('/api/vision', { cache: 'no-store' })
+  function scheduleVision(delay) {
+    clearTimeout(visionTimer);
+    visionTimer = setTimeout(poll, delay);
+  }
 
+  function poll() {
+    if (visionInFlight) return;
+    if (document.visibilityState === 'hidden') {
+      scheduleVision(VISION_EVERY_MS);
+      return;
+    }
+    visionInFlight = true;
+    fetch('/api/vision', { cache: 'no-store' })
       .then(function (res) { if (!res.ok) throw new Error('vision ' + res.status); return res.json(); })
-      .then(apply)
+      .then(function (state) {
+        apply(state);
+        visionDelay = VISION_EVERY_MS;
+      })
       .catch(function () {
         dot.className = 'live-dot is-warn';
         statusText.textContent = 'Camera feed unavailable';
         show('Camera feed unavailable');
+        visionDelay = Math.min(visionDelay * 2, VISION_MAX_BACKOFF_MS);
       })
-      .then(function () { setTimeout(poll, 2000); });
+      .then(function () {
+        visionInFlight = false;
+        scheduleVision(visionDelay);
+      });
   }
+
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState !== 'visible') return;
+    visionDelay = VISION_EVERY_MS;
+    scheduleVision(0);
+    if (mode === 'snapshot' && streaming) {
+      snapshotDelay = SNAPSHOT_EVERY_MS;
+      scheduleSnapshot(0);
+    }
+  });
 
   fetch('/api/config', { cache: 'no-store' })
     .then(function (res) { return res.ok ? res.json() : {}; })
     .then(function (config) {
-      if (config.stream) mode = config.stream;
+      if (config.stream) { mode = config.stream; plannedMode = config.stream; }
       origin = config.origin || '';
       ticket = config.ticket || '';
     })
